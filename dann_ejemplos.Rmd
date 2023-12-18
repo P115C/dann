@@ -1,0 +1,565 @@
+---
+title: "DANN"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    toc_depth: 3
+    number_sections: true
+    fig_width: 8
+    df_print: paged
+  html_notebook:
+  pdf_document: default
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+rm(list = ls())
+gc()
+
+library(dann)
+library(dplyr, warn.conflicts = FALSE)
+library(ggplot2)
+library(MASS)
+library(Metrics)
+library(class)
+library(data.table)
+library(mlbench)
+library(extraDistr)
+```
+
+# Funciones de utilidad
+```{r}
+estandarizar <- function(dt_entr, dt_prueb){
+  cols = setdiff(colnames(dt_entr), c("Y"))
+  x = dt_entr[cols]
+  
+  dt_entr_m <- data.frame(as.list(x %>% apply(2, mean)))
+  dt_entr_sd <- data.frame(as.list(x %>% apply(2, sd)))
+
+  for (c in cols){
+    dt_entr[,c] <- (dt_entr[,c] - dt_entr_m[,c]) / dt_entr_sd[,c]
+    dt_prueb[,c] <-  (dt_prueb[,c] - dt_entr_m[,c]) / dt_entr_sd[,c]
+  }
+  
+  return (list(dt_entr, dt_prueb))
+} 
+```
+
+```{r}
+correr_modelos <- function(dt_entr, dt_prueb, sdann_dim, k=5, neighborhood_size=50, 
+                           con_estandarizar=TRUE, epsilon = 1)
+{
+  if (con_estandarizar) {
+    r = estandarizar(dt_entr, dt_prueb)
+    dt_entr = r[[1]]
+    dt_prueb = r[[2]]
+  }
+  
+  modelos = c()
+  accs = c()
+  
+  m_dann <- dann(formula = Y ~ ., data = dt_entr, k = k, neighborhood_size = neighborhood_size, epsilon = epsilon)
+  ej1_prueb_pred <- predict(object = m_dann, new_data = dt_prueb, type = "class")$.pred_class
+  ej1_prueb_real <- dt_prueb$Y
+  acc = accuracy(ej1_prueb_pred, ej1_prueb_real)
+  modelos = c(modelos, "dann")
+  accs = c(accs, acc)
+
+  m_sdann <- sub_dann(formula = Y ~ ., data = dt_entr, k = k, 
+                    neighborhood_size = neighborhood_size, epsilon = epsilon, weighted = FALSE,
+                    sphere = "classical", numDim = sdann_dim) # mcd
+  ej1_prueb_pred <- predict(object = m_sdann, new_data = dt_prueb, type = "class")$.pred_class
+  ej1_prueb_real <- dt_prueb$Y
+  acc = accuracy(ej1_prueb_pred, ej1_prueb_real)
+  modelos = c(modelos, "sub_dann")
+  accs = c(accs, acc)
+  
+  m_lda <- lda(Y ~., data = dt_entr)
+  ej1_prueb_pred <- predict(m_lda, dt_prueb)$class
+  ej1_prueb_real <- dt_prueb$Y
+  acc = accuracy(ej1_prueb_pred, ej1_prueb_real)
+  modelos = c(modelos, "lda")
+  accs = c(accs, acc)
+  
+  cols = setdiff(colnames(dt_entr), c("Y"))
+  ej1_prueb_pred <- knn(dt_entr[cols], dt_prueb[cols], cl=dt_entr$Y, k = k)
+  ej1_prueb_real <- dt_prueb$Y
+  acc = accuracy(ej1_prueb_pred, ej1_prueb_real)
+  modelos = c(modelos, "knn")
+  accs = c(accs, acc)
+  
+  res = data.table(modelo=modelos, accuracy=accs)
+  return (res)  
+}
+```
+
+
+# Ejemplo gaussiana bivariada sin ruido
+```{r}
+set.seed(888)
+
+crear_gbi <- function(n){
+  n1 = as.integer(n / 2)
+  x1_std = sqrt(1)
+  x2_std = sqrt(2)
+  x_cor = matrix(c(1.0, 0.75,
+                   0.75, 1.0), 2)
+  x_cov = x_cor * as.matrix(c(x1_std,x2_std))%*%t(as.matrix(c(x1_std,x2_std)))
+  
+  xs_clase1 <- as.data.frame( mvrnorm(n=n1,
+                              mu=c(1, 1),
+                              Sigma=x_cov) )
+  colnames(xs_clase1) <- c("X1","X2")
+  xs_clase1$Y = as.factor(1)
+  
+  xs_clase2 <- as.data.frame( mvrnorm(n=n1,
+                              mu=c(3, 1),
+                              Sigma=x_cov) )
+  colnames(xs_clase2) <- c("X1","X2")
+  xs_clase2$Y = as.factor(2)
+  
+  xs_tot = rbind(xs_clase1, xs_clase2)
+  return (xs_tot)
+}
+
+ej1_entr = crear_gbi(200)
+ej1_prueb = crear_gbi(500)
+```
+
+```{r}
+ej1_entr
+```
+
+```{r}
+ggplot(data = ej1_entr, aes(X1, X2, color=Y)) +
+  geom_point() +
+  scale_color_manual(values = c("1" = "red", "2" = "yellow"))
+```
+
+```{r}
+dts = list()
+for (i in 1:20){
+  entr = crear_gbi(200)
+  prueb = crear_gbi(500)
+  dt = correr_modelos(entr, prueb, sdann_dim=2)
+  dts[[i]] = dt
+}
+dt_r = do.call(rbind, dts)
+rm(dts, entr, prueb, dt)
+```
+
+```{r}
+ggplot(dt_r) +
+  aes(x = modelo, y = accuracy) +
+  geom_boxplot(fill = "red") 
+```
+
+
+# Ejemplo gaussiana bivariada con ruido
+```{r}
+crear_gbi_ruido <- function(n, m_ruido){
+  dt = crear_gbi(n)
+  for (i in 1:m_ruido){
+    nombre_col = paste0("r", i)
+    dt[nombre_col] = rnorm(nrow(dt), mean = 0, sd = 1)
+  }
+  return (dt)
+}
+
+ej1r_entr = crear_gbi_ruido(200, 14)
+ej1r_prueb = crear_gbi_ruido(500, 14)
+```
+
+```{r}
+ej1r_entr
+```
+
+```{r}
+dts = list()
+for (i in 1:20){
+  entr = crear_gbi_ruido(200, 14)
+  prueb = crear_gbi_ruido(500, 14)
+  dt = correr_modelos(entr, prueb, sdann_dim=2)
+  dts[[i]] = dt
+}
+dt_r = do.call(rbind, dts)
+rm(dts, entr, prueb, dt)
+```
+
+```{r}
+ggplot(dt_r) +
+  aes(x = modelo, y = accuracy) +
+  geom_boxplot(fill = "red") 
+```
+
+
+# Ejemplo concéntrico
+```{r}
+crear_circulo <- function(n, m){
+  dt <- mlbench.circle(n, m) %>%
+             tibble::as_tibble()
+  nombres_col = c()
+  for (i in 1:m){
+    nombres_col = c(nombres_col, paste0("X", i))
+  }
+  nombres_col = c(nombres_col, "Y")
+  colnames(dt) <- nombres_col
+  dt <- dt %>% mutate(Y = as.factor(Y))
+  return (dt)
+}
+
+circ_entr = crear_circulo(200, 2)
+circ_prueb = crear_circulo(500, 2)
+```
+
+```{r}
+ggplot(circ_entr, aes(x = X1, y = X2, colour = Y)) +
+    geom_point() +
+    labs(title = "circ_entr", colour = "Y")
+```
+
+```{r}
+dts = list()
+for (i in 1:20){
+  entr = crear_circulo(200, 10)
+  prueb = crear_circulo(500, 10)
+  dt = correr_modelos(entr, prueb, sdann_dim=10)
+  dts[[i]] = dt
+}
+dt_r = do.call(rbind, dts)
+rm(dts, entr, prueb, dt)
+```
+
+```{r}
+ggplot(dt_r) +
+  aes(x = modelo, y = accuracy) +
+  geom_boxplot(fill = "red") 
+```
+
+# Ejemplo concéntrico con ruido
+```{r}
+crear_circulo_ruido <- function(n, m, m_ruido){
+  dt = crear_circulo(n, m)
+  for (i in 1:m_ruido){
+    nombre_col = paste0("r", i)
+    dt[nombre_col] = rnorm(nrow(dt), mean = 0, sd = 1)
+  }
+  return (dt)
+}
+
+circ_entr = crear_circulo_ruido(200, 4, 6)
+circ_prueb = crear_circulo_ruido(500, 4, 6)
+```
+
+```{r}
+ggplot(circ_entr, aes(x = X1, y = X2, colour = Y)) +
+    geom_point() +
+    labs(title = "circ_entr", colour = "Y")
+```
+
+```{r}
+dts = list()
+for (i in 1:20){
+  entr = crear_circulo_ruido(200, 4, 6)
+  prueb = crear_circulo_ruido(500, 4, 6)
+  dt = correr_modelos(entr, prueb, sdann_dim=4)
+  dts[[i]] = dt
+}
+dt_r = do.call(rbind, dts)
+rm(dts, entr, prueb, dt)
+```
+
+```{r}
+ggplot(dt_r) +
+  aes(x = modelo, y = accuracy) +
+  geom_boxplot(fill = "red") 
+```
+
+# Ejemplo sin dependencia entre clase y covariables
+```{r}
+crear_no_dep <- function(n) {
+  dt = data.frame(X1 = rnorm(n, mean = 0, sd = 1))
+  for (i in 2:6){
+    nombre_col = paste0("X", i)
+    dt[nombre_col] = rnorm(n, mean = 0, sd = 1)
+  }
+  dt["Y"] = sample(c(1,2,3,4), n, replace=TRUE, prob=c(0.1, 0.2, 0.2, 0.5))
+  dt$Y = as.factor(dt$Y)
+  return (dt)
+}
+
+no_dep_entr = crear_no_dep(200)
+no_dep_prueb = crear_no_dep(500)
+```
+
+```{r}
+table(no_dep_entr$Y)
+```
+
+```{r}
+ggplot(no_dep_entr, aes(x = X1, y = X2, colour = Y)) +
+    geom_point() +
+    labs(title = "no_dep_entr", colour = "Y")
+```
+
+```{r}
+dts = list()
+for (i in 1:20){
+  entr = crear_no_dep(200)
+  prueb = crear_no_dep(500)
+  dt = correr_modelos(entr, prueb, sdann_dim=6)
+  dts[[i]] = dt
+}
+dt_r = do.call(rbind, dts)
+rm(dts, entr, prueb, dt)
+```
+
+```{r}
+ggplot(dt_r) +
+  aes(x = modelo, y = accuracy) +
+  geom_boxplot(fill = "red") 
+```
+
+
+# Ejemplo no estructurado
+```{r}
+set.seed(555)
+
+crear_no_estr <- function(n, medias){
+  dts = list()
+  k = 1
+  for (i in 1:4){
+    for (j in 1:3) {
+      x1_std = 0.3
+      x2_std = 0.3
+      x_cor = matrix(c(1.0, 0.0,
+                       0.0, 1.0), 2)
+      x_cov = x_cor * as.matrix(c(x1_std,x2_std))%*%t(as.matrix(c(x1_std,x2_std)))
+      ms = medias[[k]]
+      x1_mu = ms[[1]]
+      x2_mu = ms[[2]]
+      dt = as.data.frame( mvrnorm(n=n,
+                           mu=c(x1_mu, x2_mu),
+                           Sigma=x_cov) )
+      colnames(dt) = c("X1","X2")
+      dt$Y = as.factor(i)
+      
+      dts[[k]] = dt
+      k = k + 1
+    }
+  }
+  dt = do.call(rbind, dts)
+  return (dt)
+}
+
+pares = expand.grid(1:5, 1:5)
+pares = split(pares, seq(nrow(pares)))
+medias = sample(pares, 4*3, replace=FALSE)
+no_estr_entr = crear_no_estr(20, medias)
+no_estr_prueb = crear_no_estr(35, medias)
+```
+
+```{r}
+no_estr_entr
+```
+
+```{r}
+ggplot(no_estr_entr, aes(x = X1, y = X2, colour = Y)) +
+    geom_point() +
+    labs(title = "no_estr_entr", colour = "Y")
+```
+
+```{r}
+dts = list()
+for (i in 1:20){
+  pares = expand.grid(1:5, 1:5)
+  pares = split(pares, seq(nrow(pares)))
+  medias = sample(pares, 4*3, replace=FALSE)
+  entr = crear_no_estr(20, medias)
+  prueb = crear_no_estr(35, medias)
+  dt = correr_modelos(entr, prueb, sdann_dim=2)
+  dts[[i]] = dt
+}
+dt_r = do.call(rbind, dts)
+rm(dts, entr, prueb, dt, medias, pares)
+```
+
+```{r}
+ggplot(dt_r) +
+  aes(x = modelo, y = accuracy) +
+  geom_boxplot(fill = "red") 
+```
+
+
+# Ejemplo no estructurado con ruido
+```{r}
+crear_no_estr_ruido <- function(n, medias, m_ruido) {
+  dt = crear_no_estr(n, medias)
+  for (i in 1:m_ruido){
+    nombre_col = paste0("r", i)
+    dt[nombre_col] = rnorm(n, mean = 0, sd = 2)
+  }
+  return (dt)
+}
+
+set.seed(818)
+pares = expand.grid(1:5, 1:5)
+pares = split(pares, seq(nrow(pares)))
+medias = sample(pares, 4*3, replace=FALSE)
+no_estr_entr = crear_no_estr_ruido(20, medias, 8)
+no_estr_prueb = crear_no_estr_ruido(30, medias, 8)
+rm(pares, medias)
+```
+
+
+```{r}
+ggplot(no_estr_entr, aes(x = X1, y = X2, colour = Y)) +
+    geom_point() +
+    labs(title = "no_estr_entr", colour = "Y")
+```
+
+```{r}
+no_estr_entr
+```
+
+```{r}
+graph_eigenvalues(
+  formula = Y ~ .,
+  data = no_estr_entr,
+  neighborhood_size = 50,
+  weighted = FALSE,
+  sphere = "mcd"
+)
+```
+
+
+```{r}
+dts = list()
+for (i in 1:20){
+  pares = expand.grid(1:5, 1:5)
+  pares = split(pares, seq(nrow(pares)))
+  medias = sample(pares, 4*3, replace=FALSE)
+  entr = crear_no_estr_ruido(20, medias, 8)
+  prueb = crear_no_estr_ruido(30, medias, 8)
+  dt = correr_modelos(entr, prueb, sdann_dim=2)
+  dts[[i]] = dt
+}
+dt_r = do.call(rbind, dts)
+rm(dts, entr, prueb, dt, medias, pares)
+```
+
+```{r}
+ggplot(dt_r) +
+  aes(x = modelo, y = accuracy) +
+  geom_boxplot(fill = "red") 
+```
+
+
+# Ejemplo de "Friedman, Flexible Metric Nearest Neighbour Classification, 1994."
+```{r}
+crear_ref6 <- function(n){
+  n1 = as.integer(n/2)
+  
+  dt1 = data.frame(X1 = rnorm(n1, mean = 0, sd = 1))
+  for (i in 2:10){
+    nombre_col = paste0("X", i)
+    dt1[nombre_col] = rnorm(n1, mean = 0, sd = 3)
+  }
+  dt1$Y = as.factor(1)
+  
+  dt2 = data.frame(X1 = rnorm(n1, mean = 0.5, sd = 1))
+  for (i in 2:10){
+    nombre_col = paste0("X", i)
+    m = sqrt(i) * 0.5
+    s = sqrt( sqrt(1/i) )
+    dt2[nombre_col] = rnorm(n1, mean = m, sd = s)
+  }
+  dt2$Y = as.factor(2)
+  
+  return( rbind(dt1, dt2) )
+}
+
+ref6_entr = crear_ref6(200)
+ref6_prueb = crear_ref6(500)
+```
+
+```{r}
+ggplot(ref6_entr, aes(x = X8, y = X9, colour = Y)) +
+    geom_point() +
+    labs(title = "ref6_entr", colour = "Y")
+```
+
+```{r}
+ggplot(ref6_prueb, aes(x = X5, y = X6, colour = Y)) +
+    geom_point() +
+    labs(title = "ref6_prueb", colour = "Y")
+```
+
+```{r}
+dts = list()
+for (i in 1:20){
+  entr = crear_ref6(200)
+  prueb = crear_ref6(500)
+  nb_size = as.integer(max(nrow(entr)/5, 50))
+  dt = correr_modelos(entr, prueb, sdann_dim=3, k=5, 
+                      neighborhood_size=nb_size)
+  dts[[i]] = dt
+}
+dt_r = do.call(rbind, dts)
+rm(dts, entr, prueb, dt)
+```
+
+```{r}
+ggplot(dt_r) +
+  aes(x = modelo, y = accuracy) +
+  geom_boxplot(fill = "red") 
+```
+
+# Ejemplo espirales
+```{r}
+crear_espiral <- function(n, sd=0.15, ciclos=3){
+  dt <- mlbench.spirals(n, ciclos, sd) %>%
+             tibble::as_tibble()
+  nombres_col = c()
+  for (i in 1:2){
+    nombres_col = c(nombres_col, paste0("X", i))
+  }
+  nombres_col = c(nombres_col, "Y")
+  colnames(dt) <- nombres_col
+  dt <- dt %>% mutate(Y = as.factor(Y))
+  return (dt)
+}
+
+entr = crear_espiral(500)
+```
+
+```{r}
+ggplot(entr, aes(x = X1, y = X2, colour = Y)) +
+    geom_point() +
+    labs(title = "entr", colour = "Y")
+```
+
+```{r}
+dts = list()
+for (i in 1:20){
+  entr = crear_espiral(200)
+  prueb = crear_espiral(500)
+  nb_size = as.integer(max(nrow(entr)/5, 50))
+  dt = correr_modelos(entr, prueb, sdann_dim=2, k=5, 
+                      neighborhood_size=nb_size)
+  dts[[i]] = dt
+}
+dt_r = do.call(rbind, dts)
+rm(dts, entr, prueb, dt)
+```
+
+```{r}
+ggplot(dt_r) +
+  aes(x = modelo, y = accuracy) +
+  geom_boxplot(fill = "red") 
+```
+
